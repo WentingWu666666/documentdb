@@ -13,8 +13,22 @@ use crate::responses::{CommandError, Response};
 use async_trait::async_trait;
 use dyn_clone::{clone_trait_object, DynClone};
 use either::Either;
+use ntex::http::StatusCode;
+use crate::error::ErrorCode;
 
 pub mod metrics_config;
+pub mod otel_metrics;
+
+fn error_code_to_status_code(error: i32) -> StatusCode {
+    match ErrorCode::from_i32(error) {
+        Some(ErrorCode::Ok) => StatusCode::OK,
+        Some(ErrorCode::AuthenticationFailed | ErrorCode::Unauthorized) => StatusCode::UNAUTHORIZED,
+        Some(ErrorCode::InternalError) => StatusCode::INTERNAL_SERVER_ERROR,
+        Some(ErrorCode::ExceededTimeLimit) => StatusCode::REQUEST_TIMEOUT,
+        Some(ErrorCode::DuplicateKey) => StatusCode::CONFLICT,
+        _ => StatusCode::BAD_REQUEST,
+    }
+}
 
 // TelemetryProvider takes care of emitting events and metrics
 // for tracking the gateway.

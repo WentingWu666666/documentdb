@@ -50,10 +50,12 @@ impl MetricsConfig {
 
         let meter = global::meter("request");
 
-        // TODO: this is just an example of how to create a counter
-        let counter = meter.u64_counter("my_counter").build();
-        counter.add(1, &[KeyValue::new("key", "value")]);
-
+        // // TODO: this is just an example of how to create a counter
+        // meter.u64_gauge("MongoRequestDurationMs")
+        //     .with_unit("ms")
+        //     .with_description("The duration of MongoDB requests in milliseconds")
+        //     .build();
+        
         Ok(())
     }
 }
