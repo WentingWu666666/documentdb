@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  * Copyright (c) Microsoft Corporation.  All rights reserved.
  *
- * src/telemetry.rs
+ * src/mod.rs
  *
  *-------------------------------------------------------------------------
  */
@@ -13,6 +13,8 @@ use crate::responses::{CommandError, Response};
 use async_trait::async_trait;
 use dyn_clone::{clone_trait_object, DynClone};
 use either::Either;
+
+pub mod metrics_config;
 
 // TelemetryProvider takes care of emitting events and metrics
 // for tracking the gateway.
