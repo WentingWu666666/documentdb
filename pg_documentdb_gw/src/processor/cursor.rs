@@ -11,6 +11,7 @@ use std::sync::Arc;
 use bson::{rawdoc, RawArrayBuf};
 
 use crate::{
+    changestream::handler::process_change_stream_get_more,
     context::{ConnectionContext, Cursor, CursorStoreEntry, RequestContext},
     error::{DocumentDBError, ErrorCode, Result},
     postgres::{Connection, PgDataClient, PgDocument},
@@ -113,17 +114,39 @@ pub async fn process_get_more(
     let request = request_context.payload;
 
     let mut id = None;
+    let mut max_time_ms = None;
     request.extract_fields(|k, v| {
         if k == "getMore" {
             id = Some(v.as_i64().ok_or(DocumentDBError::bad_value(
                 "getMore value should be an i64".to_string(),
             ))?)
         }
+        if k == "maxTimeMS" {
+            max_time_ms = v.as_i64();
+        }
         Ok(())
     })?;
     let id = id.ok_or(DocumentDBError::bad_value(
         "getMore not present in document".to_string(),
     ))?;
+
+    // First, try to get from change stream cursor store
+    match process_change_stream_get_more(id, connection_context, max_time_ms).await {
+        Ok(response) => return Ok(response),
+        Err(e) => {
+            // Only continue to regular cursor store if it's CursorNotFound
+            let is_cursor_not_found = matches!(
+                e.error_code_enum(),
+                Some(code) if code as i32 == ErrorCode::CursorNotFound as i32
+            );
+            if !is_cursor_not_found {
+                return Err(e);
+            }
+            // Fall through to regular cursor handling
+        }
+    }
+
+    // Regular cursor handling
     let CursorStoreEntry {
         conn: cursor_connection,
         cursor,

@@ -8,6 +8,7 @@
 
 pub mod auth;
 pub mod bson;
+pub mod changestream;
 pub mod configuration;
 pub mod context;
 pub mod error;

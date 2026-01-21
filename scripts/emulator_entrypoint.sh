@@ -318,6 +318,21 @@ if [ "$START_POSTGRESQL" = "true" ]; then
     /home/documentdb/gateway/scripts/start_oss_server.sh $PGOPTIONS -d $DATA_PATH -p $POSTGRESQL_PORT | tee -a "$OSS_SERVER_LOG"
 
     echo "OSS server started."
+
+    # Configure logical WAL for change stream support
+    echo "[ENTRYPOINT] Configuring PostgreSQL for change stream support..."
+    CONFIG_FILE="$DATA_PATH/postgresql.conf"
+    if [ -f "$CONFIG_FILE" ]; then
+        if ! grep -q "^wal_level = logical" "$CONFIG_FILE"; then
+            echo "" >> "$CONFIG_FILE"
+            echo "# Change stream support (added by entrypoint)" >> "$CONFIG_FILE"
+            echo "wal_level = logical" >> "$CONFIG_FILE"
+            echo "[ENTRYPOINT] Added wal_level=logical to postgresql.conf"
+            echo "[ENTRYPOINT] PostgreSQL restart required for change stream support"
+        else
+            echo "[ENTRYPOINT] wal_level=logical already configured"
+        fi
+    fi
     echo "[ENTRYPOINT] Setting up PostgreSQL log streaming..."
 
     # Start streaming PostgreSQL logs to docker logs

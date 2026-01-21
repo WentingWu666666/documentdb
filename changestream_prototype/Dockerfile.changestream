@@ -1,0 +1,70 @@
+# Custom DocumentDB image with logical WAL level for change streams
+# Build with: docker build -f Dockerfile.changestream -t documentdb-changestream .
+
+FROM ghcr.io/documentdb/documentdb/documentdb-local:latest
+
+USER root
+
+# Create custom PostgreSQL config for logical replication
+RUN mkdir -p /etc/postgresql/conf.d && \
+    echo "# Enable logical replication for change streams" > /etc/postgresql/conf.d/changestream.conf && \
+    echo "wal_level = logical" >> /etc/postgresql/conf.d/changestream.conf && \
+    echo "max_replication_slots = 10" >> /etc/postgresql/conf.d/changestream.conf && \
+    echo "max_wal_senders = 10" >> /etc/postgresql/conf.d/changestream.conf && \
+    chown documentdb:documentdb /etc/postgresql/conf.d/changestream.conf
+
+# Create a startup script that initializes with logical WAL
+RUN cat > /home/documentdb/gateway/scripts/init_logical_wal.sh << 'EOFSCRIPT'
+#!/bin/bash
+# Append logical WAL config to postgresql.conf after data directory is initialized
+DATA_DIR="${DATA_PATH:-/data}"
+CONFIG_FILE="$DATA_DIR/postgresql.conf"
+
+if [ -f "$CONFIG_FILE" ]; then
+    # Check if already configured
+    if ! grep -q "^wal_level = logical" "$CONFIG_FILE"; then
+        echo "" >> "$CONFIG_FILE"
+        echo "# Change stream support" >> "$CONFIG_FILE"
+        echo "wal_level = logical" >> "$CONFIG_FILE"
+        echo "max_replication_slots = 10" >> "$CONFIG_FILE"
+        echo "max_wal_senders = 10" >> "$CONFIG_FILE"
+        echo "Configured logical WAL level in $CONFIG_FILE"
+    fi
+fi
+EOFSCRIPT
+
+RUN chmod +x /home/documentdb/gateway/scripts/init_logical_wal.sh && \
+    chown documentdb:documentdb /home/documentdb/gateway/scripts/init_logical_wal.sh
+
+# Modify entrypoint to configure WAL before starting
+RUN sed -i 's|exec /home/documentdb/gateway/scripts/emulator_entrypoint.sh|/home/documentdb/gateway/scripts/init_logical_wal.sh \&\& exec /home/documentdb/gateway/scripts/emulator_entrypoint.sh|' /home/documentdb/gateway/scripts/emulator_entrypoint.sh 2>/dev/null || true
+
+USER documentdb
+
+# Custom entrypoint that ensures logical WAL is configured
+COPY --chown=documentdb:documentdb <<'EOF' /home/documentdb/gateway/scripts/changestream_entrypoint.sh
+#!/bin/bash
+set -e
+
+DATA_DIR="${DATA_PATH:-/data}"
+CONFIG_FILE="$DATA_DIR/postgresql.conf"
+
+# If data directory exists and has a config, ensure logical WAL is set
+if [ -f "$CONFIG_FILE" ]; then
+    if ! grep -q "^wal_level = logical" "$CONFIG_FILE"; then
+        echo "" >> "$CONFIG_FILE"
+        echo "# Change stream support" >> "$CONFIG_FILE"
+        echo "wal_level = logical" >> "$CONFIG_FILE"
+        echo "max_replication_slots = 10" >> "$CONFIG_FILE"  
+        echo "max_wal_senders = 10" >> "$CONFIG_FILE"
+        echo "[CHANGESTREAM] Configured logical WAL level"
+    fi
+fi
+
+# Run the original entrypoint
+exec /home/documentdb/gateway/scripts/emulator_entrypoint.sh "$@"
+EOF
+
+RUN chmod +x /home/documentdb/gateway/scripts/changestream_entrypoint.sh
+
+ENTRYPOINT ["/bin/bash", "-c", "/home/documentdb/gateway/scripts/changestream_entrypoint.sh \"$@\"", "--"]

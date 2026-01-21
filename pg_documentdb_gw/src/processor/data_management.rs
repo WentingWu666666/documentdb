@@ -12,6 +12,7 @@ use bson::{spec::ElementType, RawBsonRef, RawDocumentBuf};
 
 use crate::{
     bson::convert_to_bool,
+    changestream::handler::{is_change_stream_pipeline, process_change_stream},
     configuration::DynamicConfiguration,
     context::{ConnectionContext, RequestContext},
     error::{DocumentDBError, ErrorCode, Result},
@@ -72,6 +73,11 @@ pub async fn process_aggregate(
     connection_context: &ConnectionContext,
     pg_data_client: &impl PgDataClient,
 ) -> Result<Response> {
+    // Check if this is a change stream aggregate
+    if is_change_stream_pipeline(request_context.payload.document()) {
+        return process_change_stream(request_context, connection_context).await;
+    }
+
     let (response, conn) = pg_data_client
         .execute_aggregate(request_context, connection_context)
         .await?;
