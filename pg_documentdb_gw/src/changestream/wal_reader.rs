@@ -246,9 +246,22 @@ impl WalReader {
         // Refresh collection cache
         Self::refresh_collection_cache(&client, collection_cache).await?;
 
+        // Track when to refresh cache (every 5 seconds)
+        let mut last_cache_refresh = std::time::Instant::now();
+        let cache_refresh_interval = Duration::from_secs(5);
+
         // Poll for changes
         loop {
-            let changes = Self::poll_changes(&client, &config.slot_name, config.max_changes_per_poll).await?;
+            // Periodically refresh collection cache to pick up new collections
+            if last_cache_refresh.elapsed() > cache_refresh_interval {
+                if let Err(e) = Self::refresh_collection_cache(&client, collection_cache).await {
+                    log::warn!("Failed to refresh collection cache: {:?}", e);
+                }
+                last_cache_refresh = std::time::Instant::now();
+            }
+
+            let changes =
+                Self::poll_changes(&client, &config.slot_name, config.max_changes_per_poll).await?;
 
             if changes.is_empty() {
                 tokio::time::sleep(config.poll_interval).await;
@@ -258,10 +271,17 @@ impl WalReader {
             for change in changes {
                 // Filter for documentdb_data schema and documents_ tables
                 if change.schema == "documentdb_data" && change.table.starts_with("documents_") {
+                    log::debug!(
+                        "WAL reader: processing change for {}.{} (kind: {})",
+                        change.schema,
+                        change.table,
+                        change.kind
+                    );
                     // Update LSN (extract from table name for now, real impl would use actual LSN)
                     let change_arc = Arc::new(change);
                     if change_tx.send(change_arc).is_err() {
                         // No active receivers, that's okay
+                        log::trace!("WAL reader: no active receivers for change event");
                     }
                 }
             }
@@ -281,7 +301,9 @@ impl WalReader {
             .await
             .map_err(|e| DocumentDBError::internal_error(format!("Failed to check slot: {}", e)))?;
 
-        let slot_exists = rows.iter().any(|msg| matches!(msg, SimpleQueryMessage::Row(_)));
+        let slot_exists = rows
+            .iter()
+            .any(|msg| matches!(msg, SimpleQueryMessage::Row(_)));
 
         if !slot_exists {
             // Create the replication slot with test_decoding (built-in)
@@ -290,12 +312,9 @@ impl WalReader {
                 slot_name
             );
 
-            client
-                .simple_query(&create_query)
-                .await
-                .map_err(|e| {
-                    DocumentDBError::internal_error(format!("Failed to create replication slot: {}", e))
-                })?;
+            client.simple_query(&create_query).await.map_err(|e| {
+                DocumentDBError::internal_error(format!("Failed to create replication slot: {}", e))
+            })?;
 
             log::info!("Created replication slot: {}", slot_name);
         }
@@ -312,10 +331,9 @@ impl WalReader {
                      FROM documentdb_api_catalog.collections 
                      WHERE collection_id IS NOT NULL";
 
-        let rows = client
-            .simple_query(query)
-            .await
-            .map_err(|e| DocumentDBError::internal_error(format!("Failed to query collections: {}", e)))?;
+        let rows = client.simple_query(query).await.map_err(|e| {
+            DocumentDBError::internal_error(format!("Failed to query collections: {}", e))
+        })?;
 
         let mut new_cache = HashMap::new();
 
@@ -345,10 +363,9 @@ impl WalReader {
             slot_name, max_changes
         );
 
-        let rows = client
-            .simple_query(&query)
-            .await
-            .map_err(|e| DocumentDBError::internal_error(format!("Failed to poll changes: {}", e)))?;
+        let rows = client.simple_query(&query).await.map_err(|e| {
+            DocumentDBError::internal_error(format!("Failed to poll changes: {}", e))
+        })?;
 
         let mut changes = Vec::new();
 
@@ -371,7 +388,7 @@ impl WalReader {
     fn parse_test_decoding_output(data: &str) -> Option<WalChange> {
         // Format: "table schema.table: OPERATION: column[type]:value ..."
         // Example: "table documentdb_data.documents_2: INSERT: shard_key_value[bigint]:2 object_id[documentdb_core.bson]:'BSONHEX...' document[documentdb_core.bson]:'BSONHEX...'"
-        
+
         // Skip non-table entries (BEGIN, COMMIT)
         if !data.starts_with("table ") {
             return None;
@@ -410,7 +427,11 @@ impl WalReader {
 
     /// Get collection info from cache
     pub async fn get_collection_info(&self, collection_id: i64) -> Option<(String, String)> {
-        self.collection_cache.read().await.get(&collection_id).cloned()
+        self.collection_cache
+            .read()
+            .await
+            .get(&collection_id)
+            .cloned()
     }
 
     /// Extract collection_id from table name (documents_<id>)

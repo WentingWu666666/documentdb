@@ -210,6 +210,17 @@ if [ "$allowExternalAccess" == "true" ]; then
   echo "host all all ::0/0 scram-sha-256" >> $hbaConfigFile
 fi
 
+# Enable logical WAL for change stream support
+# Reference: changestream_prototype/Dockerfile.changestream
+if ! grep -q "^wal_level = logical" "$postgresConfigFile" 2>/dev/null; then
+  echo "${green}Configuring logical WAL level for change stream support${reset}"
+  echo "" >> $postgresConfigFile
+  echo "# Change stream support" >> $postgresConfigFile
+  echo "wal_level = logical" >> $postgresConfigFile
+  echo "max_replication_slots = 10" >> $postgresConfigFile
+  echo "max_wal_senders = 10" >> $postgresConfigFile
+fi
+
 if [ "$gatewayWorker" == "true" ]; then
   setupConfigurationFile="$scriptDir/../pg_documentdb_gw/SetupConfiguration.json"
   echo "documentdb_gateway.database = 'postgres'" >> $postgresConfigFile

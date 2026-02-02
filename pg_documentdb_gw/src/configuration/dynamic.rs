@@ -33,7 +33,7 @@ pub trait DynamicConfiguration: Send + Sync + Debug {
     fn as_any(&self) -> &dyn std::any::Any;
 
     async fn enable_change_streams(&self) -> bool {
-        self.get_bool("enableChangeStreams", false).await
+        self.get_bool("enableChangeStreams", true).await
     }
 
     async fn enable_connection_status(&self) -> bool {

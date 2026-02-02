@@ -201,38 +201,105 @@ impl ChangeEventTranslator {
         let mut full_document = None;
         let full_document_before_change = None; // Not available in test_decoding without REPLICA IDENTITY FULL
 
-        // Parse test_decoding format to extract BSON data
-        // Format: "... object_id[documentdb_core.bson]:'BSONHEX...' document[documentdb_core.bson]:'BSONHEX...'"
         let raw = &change.raw_data;
 
-        // Extract object_id BSON
-        if let Some(object_id_bson) = self.extract_bson_hex(raw, "object_id") {
-            if let Ok(id_doc) = bson::from_slice::<Document>(&object_id_bson) {
-                document_key = Some(id_doc);
+        // Try to extract using the new JSON-like format first
+        // Format: object_id[bson]:'{ "_id" : "..." }' document[bson]:'{ ... }'
+        if let Some(id_doc) = self.extract_bson_document(raw, "object_id") {
+            document_key = Some(id_doc);
+        }
+
+        if let Some(doc) = self.extract_bson_document(raw, "document") {
+            full_document = Some(doc);
+        }
+
+        // Fall back to hex-encoded BSON if the above didn't work
+        if document_key.is_none() {
+            if let Some(object_id_bson) = self.extract_bson_hex(raw, "object_id") {
+                if let Ok(id_doc) = bson::from_slice::<Document>(&object_id_bson) {
+                    document_key = Some(id_doc);
+                }
             }
         }
 
-        // Extract document BSON (for INSERT and UPDATE)
-        if let Some(doc_bson) = self.extract_bson_hex(raw, "document") {
-            if let Ok(doc) = bson::from_slice::<Document>(&doc_bson) {
-                full_document = Some(doc);
+        if full_document.is_none() {
+            if let Some(doc_bson) = self.extract_bson_hex(raw, "document") {
+                if let Ok(doc) = bson::from_slice::<Document>(&doc_bson) {
+                    full_document = Some(doc);
+                }
             }
         }
 
         Ok((document_key, full_document, full_document_before_change))
     }
 
-    /// Extract BSON hex data from test_decoding output
+    /// Extract BSON document from test_decoding output
+    /// Format: field_name[bson]:'{ JSON-like representation }'
+    fn extract_bson_document(&self, raw: &str, field_name: &str) -> Option<Document> {
+        // Look for pattern: field_name[bson]:'...'
+        // The type can be [bson] or [documentdb_core.bson]
+        let patterns = [
+            format!("{}[bson]:'", field_name),
+            format!("{}[documentdb_core.bson]:'", field_name),
+        ];
+
+        for pattern in &patterns {
+            if let Some(start) = raw.find(pattern) {
+                let after_pattern = start + pattern.len();
+                let rest = &raw[after_pattern..];
+
+                // Find the closing quote - need to handle nested quotes in JSON
+                // test_decoding uses ' as delimiter and escapes internal ' as ''
+                let mut end = 0;
+                let mut in_escape = false;
+                for (i, c) in rest.char_indices() {
+                    if c == '\'' && !in_escape {
+                        // Check if it's an escaped quote ''
+                        if rest[i + 1..].starts_with('\'') {
+                            in_escape = true;
+                            continue;
+                        }
+                        end = i;
+                        break;
+                    }
+                    in_escape = false;
+                }
+
+                if end > 0 {
+                    let json_str = &rest[..end];
+                    // Try to parse as Extended JSON (BSON format)
+                    if let Ok(doc) = bson::from_slice::<Document>(json_str.as_bytes()) {
+                        return Some(doc);
+                    }
+                    // Try parsing as relaxed Extended JSON
+                    if let Ok(doc) = serde_json::from_str::<Document>(json_str) {
+                        return Some(doc);
+                    }
+                    // Try parsing using bson's extended JSON parser
+                    if let Ok(bson_val) = bson::Bson::try_from(
+                        serde_json::from_str::<serde_json::Value>(json_str).ok()?,
+                    ) {
+                        if let Some(doc) = bson_val.as_document() {
+                            return Some(doc.clone());
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Legacy: Extract BSON hex data from test_decoding output (for hex-encoded BSON)
     fn extract_bson_hex(&self, raw: &str, field_name: &str) -> Option<Vec<u8>> {
         // Look for pattern: field_name[documentdb_core.bson]:'BSONHEX...'
         let pattern = format!("{}[documentdb_core.bson]:'BSONHEX", field_name);
         let start = raw.find(&pattern)?;
         let after_pattern = start + pattern.len();
-        
+
         // Find the closing quote
         let rest = &raw[after_pattern..];
         let end = rest.find('\'')?;
-        
+
         let hex_str = &rest[..end];
         hex::decode(hex_str).ok()
     }
@@ -429,8 +496,9 @@ impl ChangeEvent {
     /// Convert to RawDocumentBuf for wire protocol
     pub fn to_raw_document(&self) -> Result<RawDocumentBuf> {
         let doc = self.to_document();
-        RawDocumentBuf::from_document(&doc)
-            .map_err(|e| DocumentDBError::internal_error(format!("Failed to serialize change event: {}", e)))
+        RawDocumentBuf::from_document(&doc).map_err(|e| {
+            DocumentDBError::internal_error(format!("Failed to serialize change event: {}", e))
+        })
     }
 }
 

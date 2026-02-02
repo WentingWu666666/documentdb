@@ -16,7 +16,7 @@ use super::translator::{FullDocumentBeforeChangeOption, FullDocumentOption};
 use super::wal_reader::{WalReader, WalReaderConfig};
 use crate::context::{ConnectionContext, RequestContext};
 use crate::error::{DocumentDBError, ErrorCode, Result};
-use crate::responses::{Response, RawResponse};
+use crate::responses::{RawResponse, Response};
 
 /// Global WAL reader instance (lazily initialized)
 static WAL_READER: std::sync::OnceLock<WalReader> = std::sync::OnceLock::new();
@@ -52,9 +52,9 @@ fn get_wal_reader(connection_context: &ConnectionContext) -> Result<&'static Wal
         };
         WalReader::new(config)
     });
-    WAL_READER.get().ok_or_else(|| {
-        DocumentDBError::internal_error("WAL reader not initialized".to_string())
-    })
+    WAL_READER
+        .get()
+        .ok_or_else(|| DocumentDBError::internal_error("WAL reader not initialized".to_string()))
 }
 
 /// Get or initialize the cursor store
@@ -90,19 +90,47 @@ pub async fn process_change_stream(
         .ok_or_else(|| DocumentDBError::bad_value("Empty pipeline".to_string()))?
         .map_err(|e| DocumentDBError::bad_value(format!("Invalid pipeline: {}", e)))?;
 
-    let first_stage_doc = first_stage
-        .as_document()
-        .ok_or_else(|| DocumentDBError::bad_value("Pipeline stage must be a document".to_string()))?;
+    let first_stage_doc = first_stage.as_document().ok_or_else(|| {
+        DocumentDBError::bad_value("Pipeline stage must be a document".to_string())
+    })?;
 
     // Check for $changeStream stage
-    let change_stream_opts = first_stage_doc
-        .get_document("$changeStream")
-        .map_err(|_| {
-            DocumentDBError::documentdb_error(
-                ErrorCode::CommandNotSupported,
-                "First pipeline stage must be $changeStream".to_string(),
-            )
-        })?;
+    // First try to get it as a document
+    let change_stream_opts = match first_stage_doc.get_document("$changeStream") {
+        Ok(doc) => doc,
+        Err(e) => {
+            // Check if the key exists at all
+            match first_stage_doc.get("$changeStream") {
+                Ok(Some(val)) => {
+                    log::warn!(
+                        "Found $changeStream but couldn't parse as document: {:?}, error: {:?}",
+                        val,
+                        e
+                    );
+                    // If it's an empty document, create an empty RawDocument
+                    return Err(DocumentDBError::documentdb_error(
+                        ErrorCode::CommandNotSupported,
+                        format!(
+                            "$changeStream value must be a document, got type error: {}",
+                            e
+                        ),
+                    ));
+                }
+                Ok(None) => {
+                    return Err(DocumentDBError::documentdb_error(
+                        ErrorCode::CommandNotSupported,
+                        "First pipeline stage must be $changeStream".to_string(),
+                    ));
+                }
+                Err(key_err) => {
+                    return Err(DocumentDBError::documentdb_error(
+                        ErrorCode::CommandNotSupported,
+                        format!("Failed to get $changeStream key: {}", key_err),
+                    ));
+                }
+            }
+        }
+    };
 
     // Parse change stream options
     let options = parse_change_stream_options(
@@ -147,8 +175,9 @@ pub async fn process_change_stream(
     cursor_store.add_cursor(cursor).await;
 
     // Convert to raw response
-    let raw_doc = bson::RawDocumentBuf::from_document(&response_doc)
-        .map_err(|e| DocumentDBError::internal_error(format!("Failed to serialize response: {}", e)))?;
+    let raw_doc = bson::RawDocumentBuf::from_document(&response_doc).map_err(|e| {
+        DocumentDBError::internal_error(format!("Failed to serialize response: {}", e))
+    })?;
 
     Ok(Response::Raw(RawResponse(raw_doc)))
 }
@@ -185,8 +214,9 @@ pub async fn process_change_stream_get_more(
     // Return cursor to store
     cursor_store.return_cursor(cursor).await;
 
-    let raw_doc = bson::RawDocumentBuf::from_document(&response_doc)
-        .map_err(|e| DocumentDBError::internal_error(format!("Failed to serialize response: {}", e)))?;
+    let raw_doc = bson::RawDocumentBuf::from_document(&response_doc).map_err(|e| {
+        DocumentDBError::internal_error(format!("Failed to serialize response: {}", e))
+    })?;
 
     Ok(Response::Raw(RawResponse(raw_doc)))
 }
@@ -227,7 +257,11 @@ fn parse_change_stream_options(
     remaining_pipeline: &[Document],
 ) -> Result<ChangeStreamOptions> {
     let mut options = ChangeStreamOptions {
-        database: if db.is_empty() { None } else { Some(db.to_string()) },
+        database: if db.is_empty() {
+            None
+        } else {
+            Some(db.to_string())
+        },
         collection: if collection.is_empty() {
             None
         } else {
@@ -303,10 +337,12 @@ fn pipeline_without_first(pipeline: &bson::raw::RawArray) -> Result<Vec<Document
             first = false;
             continue;
         }
-        let raw_bson = item.map_err(|e| DocumentDBError::bad_value(format!("Invalid pipeline: {}", e)))?;
+        let raw_bson =
+            item.map_err(|e| DocumentDBError::bad_value(format!("Invalid pipeline: {}", e)))?;
         if let Some(doc) = raw_bson.as_document() {
-            let parsed: Document = bson::from_slice(doc.as_bytes())
-                .map_err(|e| DocumentDBError::bad_value(format!("Invalid pipeline stage: {}", e)))?;
+            let parsed: Document = bson::from_slice(doc.as_bytes()).map_err(|e| {
+                DocumentDBError::bad_value(format!("Invalid pipeline stage: {}", e))
+            })?;
             stages.push(parsed);
         }
     }

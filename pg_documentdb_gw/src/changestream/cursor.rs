@@ -97,11 +97,7 @@ pub struct ChangeStreamCursor {
 
 impl ChangeStreamCursor {
     /// Create a new change stream cursor
-    pub fn new(
-        options: ChangeStreamOptions,
-        username: String,
-        wal_reader: WalReader,
-    ) -> Self {
+    pub fn new(options: ChangeStreamOptions, username: String, wal_reader: WalReader) -> Self {
         let cursor_id = generate_cursor_id();
         let change_rx = wal_reader.subscribe();
 
@@ -128,7 +124,9 @@ impl ChangeStreamCursor {
     /// Get the next batch of change events
     pub async fn get_next_batch(&mut self, max_time_ms: Option<i64>) -> Result<Vec<ChangeEvent>> {
         if self.closed {
-            return Err(DocumentDBError::internal_error("Cursor is closed".to_string()));
+            return Err(DocumentDBError::internal_error(
+                "Cursor is closed".to_string(),
+            ));
         }
 
         self.last_accessed = Instant::now();
@@ -160,7 +158,11 @@ impl ChangeStreamCursor {
                     }
                 }
                 Ok(Err(broadcast::error::RecvError::Lagged(n))) => {
-                    log::warn!("Change stream cursor {} lagged by {} events", self.cursor_id, n);
+                    log::warn!(
+                        "Change stream cursor {} lagged by {} events",
+                        self.cursor_id,
+                        n
+                    );
                     // Continue receiving
                 }
                 Ok(Err(broadcast::error::RecvError::Closed)) => {
@@ -189,13 +191,25 @@ impl ChangeStreamCursor {
         let collection_id = WalReader::extract_collection_id(&change.table)?;
 
         // Look up collection metadata
-        let (db_name, collection_name) = self.wal_reader.get_collection_info(collection_id).await?;
+        let collection_info = self.wal_reader.get_collection_info(collection_id).await;
+        if collection_info.is_none() {
+            log::debug!(
+                "Change stream: collection_id {} not found in cache (table: {}), event dropped",
+                collection_id,
+                change.table
+            );
+            return None;
+        }
+        let (db_name, collection_name) = collection_info.unwrap();
 
         // Get current LSN (simplified - in production would track actual LSN)
         let lsn = self.wal_reader.current_lsn().await;
 
         // Translate the change
-        match self.translator.translate(change, &db_name, &collection_name, collection_id, lsn) {
+        match self
+            .translator
+            .translate(change, &db_name, &collection_name, collection_id, lsn)
+        {
             Ok(event) => Some(event),
             Err(e) => {
                 log::warn!("Failed to translate WAL change: {:?}", e);
@@ -281,14 +295,22 @@ impl ChangeStreamCursor {
     }
 
     /// Build cursor document with batch
-    fn build_cursor_document(&self, batch: Vec<ChangeEvent>, is_first_batch: bool) -> Result<Document> {
+    fn build_cursor_document(
+        &self,
+        batch: Vec<ChangeEvent>,
+        is_first_batch: bool,
+    ) -> Result<Document> {
         let batch_docs: Vec<Document> = batch.iter().map(|e| e.to_document()).collect();
 
-        let batch_key = if is_first_batch { "firstBatch" } else { "nextBatch" };
-        
+        let batch_key = if is_first_batch {
+            "firstBatch"
+        } else {
+            "nextBatch"
+        };
+
         let mut cursor_doc = doc! {
             "id": if self.closed { 0i64 } else { self.cursor_id },
-            "ns": format!("{}.{}", 
+            "ns": format!("{}.{}",
                 self.options.database.as_deref().unwrap_or("admin"),
                 self.options.collection.as_deref().unwrap_or("$cmd.aggregate")
             ),
