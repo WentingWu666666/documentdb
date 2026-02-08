@@ -38,13 +38,29 @@ pub fn init_wal_reader(connection_string: &str) {
 fn get_wal_reader(connection_context: &ConnectionContext) -> Result<&'static WalReader> {
     WAL_READER.get_or_init(|| {
         // Build connection string from service context
-        // Use documentdb superuser with socket auth for replication
+        // Use documentdb superuser for replication - use TCP if postgres_host_name is set
         let setup_config = connection_context.service_context.setup_configuration();
-        let conn_str = format!(
-            "host=/run/postgresql port={} dbname={} user=documentdb",
-            setup_config.postgres_port(),
-            setup_config.postgres_database(),
-        );
+        let host = setup_config.postgres_host_name();
+        
+        // Determine database name: DocumentDB data is in postgres database (where extensions are installed)
+        let database = setup_config.postgres_database();
+        
+        let conn_str = if host == "localhost" || host.starts_with("/") == false {
+            // Use TCP connection for remote or localhost
+            format!(
+                "host={} port={} dbname={} user=documentdb",
+                host,
+                setup_config.postgres_port(),
+                database,
+            )
+        } else {
+            // Use socket connection - default PostgreSQL socket is in /tmp
+            format!(
+                "host=/tmp port={} dbname={} user=documentdb",
+                setup_config.postgres_port(),
+                database,
+            )
+        };
         log::info!("WAL reader connection string: {}", conn_str);
         let config = WalReaderConfig {
             connection_string: conn_str,
@@ -73,6 +89,7 @@ pub async fn process_change_stream(
     request_context: &mut RequestContext<'_>,
     connection_context: &ConnectionContext,
 ) -> Result<Response> {
+    log::info!("process_change_stream ENTERED");
     let doc = request_context.payload.document();
 
     // Parse the aggregate command
@@ -143,6 +160,7 @@ pub async fn process_change_stream(
 
     // Get or start the WAL reader
     let wal_reader = get_wal_reader(connection_context)?;
+    log::info!("WAL reader obtained, starting...");
 
     // Start WAL reader if not running
     if let Err(e) = wal_reader.start().await {
@@ -152,6 +170,7 @@ pub async fn process_change_stream(
             e
         )));
     }
+    log::info!("WAL reader started successfully");
 
     // Get username for cursor ownership
     let username = connection_context
@@ -226,7 +245,10 @@ pub fn is_change_stream_pipeline(doc: &RawDocument) -> bool {
     if let Ok(pipeline) = doc.get_array("pipeline") {
         if let Some(Ok(first_stage)) = pipeline.into_iter().next() {
             if let Some(stage_doc) = first_stage.as_document() {
-                return stage_doc.get("$changeStream").is_ok();
+                // Check if $changeStream key exists AND has a value (not None)
+                if let Ok(Some(_)) = stage_doc.get("$changeStream") {
+                    return true;
+                }
             }
         }
     }

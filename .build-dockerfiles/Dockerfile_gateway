@@ -1,0 +1,68 @@
+# Build documentdb-gateway image using local repo
+# Modified from: https://github.com/documentdb/documentdb-kubernetes-operator/blob/main/.github/dockerfiles/Dockerfile_gateway
+# Usage: docker build -t documentdb-gateway:changestream -f .build-dockerfiles/Dockerfile_gateway .
+FROM mcr.microsoft.com/mirror/docker/library/ubuntu:22.04 AS stage
+
+# Install dependencies
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    jq curl sudo git make build-essential openssl pkg-config libssl-dev ca-certificates wget unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create documentdb user
+RUN useradd -ms /bin/bash documentdb -G sudo
+RUN echo "%sudo ALL=(ALL:ALL) NOPASSWD: ALL" >> /etc/sudoers.d/no-pass-ask
+
+# Install rustup (which includes rustc and cargo) in user directory
+ENV RUSTUP_HOME=/home/documentdb/.rustup \
+    CARGO_HOME=/home/documentdb/.cargo \
+    PATH=/home/documentdb/.cargo/bin:$PATH
+
+RUN curl https://sh.rustup.rs -sSf | sh -s -- -y --no-modify-path --default-toolchain stable
+RUN chown -R documentdb:documentdb /home/documentdb/.rustup /home/documentdb/.cargo
+
+RUN rustc --version && cargo --version
+
+USER documentdb
+WORKDIR /home/documentdb/code/
+
+# Copy local documentdb repository (instead of downloading from GitHub)
+COPY --chown=documentdb:documentdb . /home/documentdb/code/documentdb-local/
+
+WORKDIR /home/documentdb/code/documentdb-local/pg_documentdb_gw
+
+# Compile the code
+RUN cargo build
+
+#------------------------------------------------------------------------------------------------
+
+FROM mcr.microsoft.com/mirror/docker/library/ubuntu:22.04 AS final
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    jq openssl lsof sudo ca-certificates netcat-openbsd postgresql-client && \
+    apt-get upgrade -y && \
+    rm -rf /var/lib/apt/lists/*
+
+ENV LANGUAGE=en_US.UTF-8 \
+    TERM=xterm-256color
+
+# Create documentdb user
+RUN useradd -ms /bin/bash documentdb -G sudo
+RUN echo "%sudo ALL=(ALL:ALL) NOPASSWD: ALL" >> /etc/sudoers.d/no-pass-ask
+
+USER documentdb
+
+RUN sudo mkdir -p /home/documentdb/gateway/pg_documentdb_gw/target/release-with-symbols
+
+COPY --from=stage /home/documentdb/code/documentdb-local/pg_documentdb_gw/target/debug/documentdb_gateway /home/documentdb/gateway/pg_documentdb_gw/target/release-with-symbols/documentdb_gateway
+COPY --from=stage /home/documentdb/code/documentdb-local/pg_documentdb_gw/SetupConfiguration.json /home/documentdb/gateway/pg_documentdb_gw/SetupConfiguration.json
+COPY --from=stage /home/documentdb/code/documentdb-local/scripts/build_and_start_gateway.sh /home/documentdb/gateway/scripts/build_and_start_gateway.sh
+COPY --from=stage /home/documentdb/code/documentdb-local/scripts/utils.sh /home/documentdb/gateway/scripts/utils.sh
+COPY --from=stage /home/documentdb/code/documentdb-local/scripts/emulator_entrypoint.sh /home/documentdb/gateway/scripts/emulator_entrypoint.sh
+
+RUN sudo chown -R documentdb:documentdb /home/documentdb/gateway
+
+WORKDIR /home/documentdb/gateway/scripts
+
+ENTRYPOINT ["/bin/bash", "-c", "/home/documentdb/gateway/scripts/emulator_entrypoint.sh \"$@\"", "--"]

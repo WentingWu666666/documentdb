@@ -89,7 +89,11 @@ impl Default for WalReaderConfig {
 pub enum WalReaderState {
     /// Not yet started
     Stopped,
-    /// Currently running
+    /// Starting up, connecting to PostgreSQL
+    Starting,
+    /// Connected and actively polling for changes
+    Connected,
+    /// Currently running (legacy, same as Connected)
     Running,
     /// Error state
     Error,
@@ -107,6 +111,8 @@ pub struct WalReader {
     reader_task: Arc<RwLock<Option<JoinHandle<()>>>>,
     /// Collection metadata cache: collection_id -> (db_name, collection_name)
     collection_cache: Arc<RwLock<HashMap<i64, (String, String)>>>,
+    /// Ready signal: notifies when connection is established
+    ready_notify: Arc<tokio::sync::Notify>,
 }
 
 impl WalReader {
@@ -121,6 +127,7 @@ impl WalReader {
             change_tx,
             reader_task: Arc::new(RwLock::new(None)),
             collection_cache: Arc::new(RwLock::new(HashMap::new())),
+            ready_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -139,21 +146,21 @@ impl WalReader {
         *self.state.read().await
     }
 
-    /// Start the WAL reader
+    /// Start the WAL reader and wait for connection to be established
     pub async fn start(&self) -> Result<()> {
-        let mut state = self.state.write().await;
-        if *state == WalReaderState::Running {
+        let current_state = *self.state.read().await;
+        if current_state == WalReaderState::Running || current_state == WalReaderState::Connected {
             return Ok(());
         }
 
-        *state = WalReaderState::Running;
-        drop(state);
+        *self.state.write().await = WalReaderState::Starting;
 
         let config = self.config.clone();
         let state = Arc::clone(&self.state);
         let current_lsn = Arc::clone(&self.current_lsn);
         let change_tx = self.change_tx.clone();
         let collection_cache = Arc::clone(&self.collection_cache);
+        let ready_notify = Arc::clone(&self.ready_notify);
 
         let task = tokio::spawn(async move {
             if let Err(e) = Self::reader_loop(
@@ -162,6 +169,7 @@ impl WalReader {
                 current_lsn,
                 change_tx,
                 collection_cache,
+                ready_notify,
             )
             .await
             {
@@ -171,7 +179,23 @@ impl WalReader {
         });
 
         *self.reader_task.write().await = Some(task);
-        Ok(())
+
+        // Wait for ready signal with timeout (max 5 seconds)
+        let wait_result = tokio::time::timeout(
+            Duration::from_secs(5),
+            self.ready_notify.notified()
+        ).await;
+
+        match wait_result {
+            Ok(_) => {
+                log::info!("WAL reader connected and ready");
+                Ok(())
+            }
+            Err(_) => {
+                log::warn!("WAL reader start timed out, continuing anyway");
+                Ok(()) // Don't fail, the reader might still connect
+            }
+        }
     }
 
     /// Stop the WAL reader
@@ -189,13 +213,16 @@ impl WalReader {
         current_lsn: Arc<RwLock<u64>>,
         change_tx: broadcast::Sender<Arc<WalChange>>,
         collection_cache: Arc<RwLock<HashMap<i64, (String, String)>>>,
+        ready_notify: Arc<tokio::sync::Notify>,
     ) -> Result<()> {
         // Use regular connection (not replication mode) for polling
         // pg_logical_slot_get_changes works with regular connections
         let conn_str = config.connection_string.clone();
+        let mut notified = false;
 
         loop {
-            if *state.read().await != WalReaderState::Running {
+            let current_state = *state.read().await;
+            if current_state == WalReaderState::Stopped || current_state == WalReaderState::Error {
                 break;
             }
 
@@ -206,6 +233,9 @@ impl WalReader {
                 &current_lsn,
                 &change_tx,
                 &collection_cache,
+                &state,
+                &ready_notify,
+                &mut notified,
             )
             .await
             {
@@ -227,6 +257,9 @@ impl WalReader {
         _current_lsn: &Arc<RwLock<u64>>,
         change_tx: &broadcast::Sender<Arc<WalChange>>,
         collection_cache: &Arc<RwLock<HashMap<i64, (String, String)>>>,
+        state: &Arc<RwLock<WalReaderState>>,
+        ready_notify: &Arc<tokio::sync::Notify>,
+        notified: &mut bool,
     ) -> Result<()> {
         // Note: In production, use TLS. For prototype, using NoTls.
         let (client, connection) = tokio_postgres::connect(conn_str, NoTls)
@@ -246,20 +279,16 @@ impl WalReader {
         // Refresh collection cache
         Self::refresh_collection_cache(&client, collection_cache).await?;
 
-        // Track when to refresh cache (every 5 seconds)
-        let mut last_cache_refresh = std::time::Instant::now();
-        let cache_refresh_interval = Duration::from_secs(5);
+        // Mark as connected and notify waiters (only once)
+        *state.write().await = WalReaderState::Connected;
+        if !*notified {
+            log::info!("WAL reader connected, signaling ready");
+            ready_notify.notify_waiters();
+            *notified = true;
+        }
 
-        // Poll for changes
+        // Poll for changes (on-demand cache refresh only - no periodic refresh)
         loop {
-            // Periodically refresh collection cache to pick up new collections
-            if last_cache_refresh.elapsed() > cache_refresh_interval {
-                if let Err(e) = Self::refresh_collection_cache(&client, collection_cache).await {
-                    log::warn!("Failed to refresh collection cache: {:?}", e);
-                }
-                last_cache_refresh = std::time::Instant::now();
-            }
-
             let changes =
                 Self::poll_changes(&client, &config.slot_name, config.max_changes_per_poll).await?;
 
@@ -271,13 +300,33 @@ impl WalReader {
             for change in changes {
                 // Filter for documentdb_data schema and documents_ tables
                 if change.schema == "documentdb_data" && change.table.starts_with("documents_") {
+                    // Extract collection_id from table name (documents_<id>)
+                    let collection_id_str = change.table.strip_prefix("documents_").unwrap_or("0");
+                    if let Ok(collection_id) = collection_id_str.parse::<i64>() {
+                        // Check if collection is in cache, if not refresh immediately
+                        let needs_refresh = {
+                            let cache = collection_cache.read().await;
+                            !cache.contains_key(&collection_id)
+                        };
+                        
+                        if needs_refresh {
+                            log::info!(
+                                "WAL reader: unknown collection_id {}, refreshing cache on-demand",
+                                collection_id
+                            );
+                            if let Err(e) = Self::refresh_collection_cache(&client, collection_cache).await {
+                                log::warn!("Failed to refresh collection cache on-demand: {:?}", e);
+                            }
+                        }
+                    }
+
                     log::debug!(
                         "WAL reader: processing change for {}.{} (kind: {})",
                         change.schema,
                         change.table,
                         change.kind
                     );
-                    // Update LSN (extract from table name for now, real impl would use actual LSN)
+                    // Broadcast the change - subscribers will resolve collection names
                     let change_arc = Arc::new(change);
                     if change_tx.send(change_arc).is_err() {
                         // No active receivers, that's okay
@@ -455,6 +504,7 @@ impl Clone for WalReader {
             change_tx: self.change_tx.clone(),
             reader_task: Arc::clone(&self.reader_task),
             collection_cache: Arc::clone(&self.collection_cache),
+            ready_notify: Arc::clone(&self.ready_notify),
         }
     }
 }
