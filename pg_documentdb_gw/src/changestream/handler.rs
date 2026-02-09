@@ -179,8 +179,8 @@ pub async fn process_change_stream(
         .map(|s| s.to_string())
         .unwrap_or_else(|_| "unknown".to_string());
 
-    // Create the change stream cursor
-    let mut cursor = ChangeStreamCursor::new(options, username, wal_reader.clone());
+    // Create the change stream cursor (async to allow replay from resumeAfter LSN)
+    let mut cursor = ChangeStreamCursor::new(options, username, wal_reader.clone()).await;
 
     // Get initial batch (may be empty if no changes yet)
     let max_time_ms = request_context.info.max_time_ms;

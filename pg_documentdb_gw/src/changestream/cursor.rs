@@ -8,7 +8,7 @@
  *-------------------------------------------------------------------------
  */
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -93,11 +93,16 @@ pub struct ChangeStreamCursor {
     pub last_accessed: Instant,
     /// Whether the cursor is closed
     pub closed: bool,
+    /// Last LSN from replay buffer - used to skip duplicates from broadcast
+    replay_last_lsn: Option<u64>,
+    /// Set of LSNs already emitted - prevents duplicates from replay + broadcast
+    seen_lsns: HashSet<u64>,
 }
 
 impl ChangeStreamCursor {
     /// Create a new change stream cursor
-    pub fn new(options: ChangeStreamOptions, username: String, wal_reader: WalReader) -> Self {
+    /// If options.resume_after is provided, missed changes will be replayed from that LSN
+    pub async fn new(options: ChangeStreamOptions, username: String, wal_reader: WalReader) -> Self {
         let cursor_id = generate_cursor_id();
         let change_rx = wal_reader.subscribe();
 
@@ -106,6 +111,80 @@ impl ChangeStreamCursor {
             full_document_before_change: options.full_document_before_change,
         };
 
+        // If resume_after is provided, replay missed changes from that LSN
+        let mut replay_buffer: Vec<ChangeEvent> = Vec::new();
+        let mut replay_last_lsn: Option<u64> = None;
+        
+        if let Some(ref resume_token) = options.resume_after {
+            let start_lsn = resume_token.lsn;
+            log::info!(
+                "Cursor {} resuming from LSN {} (collection_id: {}, db filter: {:?}, coll filter: {:?})",
+                cursor_id,
+                start_lsn,
+                resume_token.collection_id,
+                options.database,
+                options.collection
+            );
+
+            // Replay changes from the WAL starting at the resume token's LSN
+            match wal_reader.replay_from_lsn(start_lsn).await {
+                Ok(changes) => {
+                    log::info!("Replayed {} changes from LSN {}", changes.len(), start_lsn);
+                    
+                    // Create a temporary translator to convert changes to events
+                    let temp_translator = ChangeEventTranslator::with_options(translator_options.clone());
+                    
+                    for change in changes {
+                        // Track max LSN for deduplication against broadcast
+                        if change.lsn > replay_last_lsn.unwrap_or(0) {
+                            replay_last_lsn = Some(change.lsn);
+                        }
+                        
+                        // Extract collection_id from table name
+                        if let Some(collection_id) = WalReader::extract_collection_id(&change.table) {
+                            // Get collection info for this change
+                            if let Some((db_name, coll_name)) = wal_reader.get_collection_info(collection_id).await {
+                                // Filter by database/collection if options specify them
+                                let db_matches = options.database.as_ref()
+                                    .map(|d| d == &db_name)
+                                    .unwrap_or(true);
+                                let coll_matches = options.collection.as_ref()
+                                    .map(|c| c == &coll_name)
+                                    .unwrap_or(true);
+                                
+                                if db_matches && coll_matches {
+                                    // Use the LSN from the change itself
+                                    let change_lsn = change.lsn;
+                                    log::info!(
+                                        "Replay: including change for {}.{} (lsn: {})",
+                                        db_name, coll_name, change_lsn
+                                    );
+                                    match temp_translator.translate(&change, &db_name, &coll_name, collection_id, change_lsn) {
+                                        Ok(event) => {
+                                            replay_buffer.push(event);
+                                        }
+                                        Err(e) => {
+                                            log::warn!("Failed to translate replayed change: {:?}", e);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    log::info!("Buffered {} events for replay to cursor {} (replay_last_lsn: {:?})", 
+                              replay_buffer.len(), cursor_id, replay_last_lsn);
+                }
+                Err(e) => {
+                    log::warn!("Failed to replay changes from LSN {}: {:?}", start_lsn, e);
+                }
+            }
+        }
+
+        // Build set of LSNs from replay buffer to prevent duplicates from broadcast
+        let seen_lsns: HashSet<u64> = replay_buffer.iter()
+            .map(|e| e.resume_token.lsn)
+            .collect();
+
         Self {
             cursor_id,
             options,
@@ -113,11 +192,13 @@ impl ChangeStreamCursor {
             translator: ChangeEventTranslator::with_options(translator_options),
             change_rx,
             wal_reader,
-            event_buffer: Vec::new(),
+            event_buffer: replay_buffer,
             last_resume_token: None,
             created_at: Instant::now(),
             last_accessed: Instant::now(),
             closed: false,
+            replay_last_lsn,
+            seen_lsns,
         }
     }
 
@@ -151,8 +232,20 @@ impl ChangeStreamCursor {
 
             match tokio::time::timeout(remaining, self.change_rx.recv()).await {
                 Ok(Ok(change)) => {
+                    // Skip events that were already emitted (from replay buffer)
+                    // This prevents duplicates when resumeAfter is used
+                    if self.seen_lsns.contains(&change.lsn) {
+                        log::trace!(
+                            "Skipping change with LSN {} (already in seen_lsns)",
+                            change.lsn
+                        );
+                        continue;
+                    }
+                    
                     if let Some(event) = self.process_change(&change).await {
                         if self.matches_filter(&event) {
+                            // Track this LSN as seen
+                            self.seen_lsns.insert(change.lsn);
                             batch.push(event);
                         }
                     }
@@ -202,8 +295,8 @@ impl ChangeStreamCursor {
         }
         let (db_name, collection_name) = collection_info.unwrap();
 
-        // Get current LSN (simplified - in production would track actual LSN)
-        let lsn = self.wal_reader.current_lsn().await;
+        // Use the LSN from the change itself (populated by poll_changes)
+        let lsn = change.lsn;
 
         // Translate the change
         match self

@@ -1,0 +1,4 @@
+# Exclude target directories to avoid file lock issues
+**/target
+**/.git
+**/node_modules

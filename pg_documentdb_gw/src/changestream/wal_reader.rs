@@ -9,7 +9,7 @@
  *-------------------------------------------------------------------------
  */
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,6 +18,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, RwLock};
 use tokio::task::JoinHandle;
 use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
+
+/// Maximum number of changes to keep in replay buffer
+const REPLAY_BUFFER_SIZE: usize = 10000;
 
 use crate::error::{DocumentDBError, Result};
 
@@ -45,6 +48,9 @@ pub struct WalChange {
     /// Raw data string from test_decoding (for BSON extraction)
     #[serde(default)]
     pub raw_data: String,
+    /// WAL Log Sequence Number for this change (for resume token)
+    #[serde(default)]
+    pub lsn: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,6 +119,8 @@ pub struct WalReader {
     collection_cache: Arc<RwLock<HashMap<i64, (String, String)>>>,
     /// Ready signal: notifies when connection is established
     ready_notify: Arc<tokio::sync::Notify>,
+    /// Sliding window buffer for replay (keeps last REPLAY_BUFFER_SIZE changes)
+    replay_buffer: Arc<RwLock<VecDeque<Arc<WalChange>>>>,
 }
 
 impl WalReader {
@@ -128,12 +136,42 @@ impl WalReader {
             reader_task: Arc::new(RwLock::new(None)),
             collection_cache: Arc::new(RwLock::new(HashMap::new())),
             ready_notify: Arc::new(tokio::sync::Notify::new()),
+            replay_buffer: Arc::new(RwLock::new(VecDeque::with_capacity(REPLAY_BUFFER_SIZE))),
         }
     }
 
     /// Subscribe to changes
     pub fn subscribe(&self) -> broadcast::Receiver<Arc<WalChange>> {
         self.change_tx.subscribe()
+    }
+
+    /// Get the connection string for creating new connections
+    pub fn connection_string(&self) -> &str {
+        &self.config.connection_string
+    }
+
+    /// Get the slot name
+    pub fn slot_name(&self) -> &str {
+        &self.config.slot_name
+    }
+
+    /// Replay changes from a specific LSN (for resumeAfter)
+    /// Returns changes that occurred AFTER the given LSN from the in-memory buffer
+    pub async fn replay_from_lsn(&self, start_lsn: u64) -> Result<Vec<WalChange>> {
+        log::info!("Replaying changes from LSN {} ({}) using in-memory buffer", 
+                   start_lsn, Self::format_lsn(start_lsn));
+        
+        // Read from the in-memory replay buffer
+        let buffer = self.replay_buffer.read().await;
+        
+        let changes: Vec<WalChange> = buffer.iter()
+            .filter(|change| change.lsn > start_lsn)
+            .map(|change| (**change).clone())
+            .collect();
+        
+        log::info!("Found {} changes in buffer after LSN {}", changes.len(), start_lsn);
+        
+        Ok(changes)
     }
 
     /// Get current LSN
@@ -161,6 +199,7 @@ impl WalReader {
         let change_tx = self.change_tx.clone();
         let collection_cache = Arc::clone(&self.collection_cache);
         let ready_notify = Arc::clone(&self.ready_notify);
+        let replay_buffer = Arc::clone(&self.replay_buffer);
 
         let task = tokio::spawn(async move {
             if let Err(e) = Self::reader_loop(
@@ -170,6 +209,7 @@ impl WalReader {
                 change_tx,
                 collection_cache,
                 ready_notify,
+                replay_buffer,
             )
             .await
             {
@@ -214,6 +254,7 @@ impl WalReader {
         change_tx: broadcast::Sender<Arc<WalChange>>,
         collection_cache: Arc<RwLock<HashMap<i64, (String, String)>>>,
         ready_notify: Arc<tokio::sync::Notify>,
+        replay_buffer: Arc<RwLock<VecDeque<Arc<WalChange>>>>,
     ) -> Result<()> {
         // Use regular connection (not replication mode) for polling
         // pg_logical_slot_get_changes works with regular connections
@@ -236,6 +277,7 @@ impl WalReader {
                 &state,
                 &ready_notify,
                 &mut notified,
+                &replay_buffer,
             )
             .await
             {
@@ -260,6 +302,7 @@ impl WalReader {
         state: &Arc<RwLock<WalReaderState>>,
         ready_notify: &Arc<tokio::sync::Notify>,
         notified: &mut bool,
+        replay_buffer: &Arc<RwLock<VecDeque<Arc<WalChange>>>>,
     ) -> Result<()> {
         // Note: In production, use TLS. For prototype, using NoTls.
         let (client, connection) = tokio_postgres::connect(conn_str, NoTls)
@@ -320,14 +363,26 @@ impl WalReader {
                         }
                     }
 
-                    log::debug!(
-                        "WAL reader: processing change for {}.{} (kind: {})",
-                        change.schema,
-                        change.table,
-                        change.kind
-                    );
+                    // Wrap in Arc for sharing
+                    let change_arc = Arc::new(change.clone());
+                    
+                    // Store in replay buffer (sliding window) - dedupe by raw_data content
+                    // Note: test_decoding reports transaction-level LSN, so multiple rows in
+                    // the same transaction have the same LSN. Use raw_data for deduplication.
+                    {
+                        let mut buffer = replay_buffer.write().await;
+                        
+                        // Only add if this exact change (by raw_data) is not already in buffer
+                        let already_exists = buffer.iter().any(|c| c.raw_data == change.raw_data);
+                        if !already_exists {
+                            if buffer.len() >= REPLAY_BUFFER_SIZE {
+                                buffer.pop_front();  // Remove oldest
+                            }
+                            buffer.push_back(Arc::clone(&change_arc));
+                        }
+                    }
+                    
                     // Broadcast the change - subscribers will resolve collection names
-                    let change_arc = Arc::new(change);
                     if change_tx.send(change_arc).is_err() {
                         // No active receivers, that's okay
                         log::trace!("WAL reader: no active receivers for change event");
@@ -401,14 +456,19 @@ impl WalReader {
     }
 
     /// Poll for changes from the replication slot
+    /// Uses pg_logical_slot_get_changes which reads AND consumes changes.
+    /// The in-memory replay buffer is used for resumeAfter functionality.
     async fn poll_changes(
         client: &Client,
         slot_name: &str,
         max_changes: i32,
     ) -> Result<Vec<WalChange>> {
-        // Use pg_logical_slot_get_changes to consume changes with test_decoding
+        // Use pg_logical_slot_get_changes to read AND consume changes
+        // This ensures we don't re-read the same changes on each poll
+        // The in-memory replay buffer stores recent changes for resumeAfter
+        // Format: (lsn pg_lsn, xid xid, data text)
         let query = format!(
-            "SELECT data FROM pg_logical_slot_get_changes('{}', NULL, {})",
+            "SELECT lsn, data FROM pg_logical_slot_get_changes('{}', NULL, {})",
             slot_name, max_changes
         );
 
@@ -420,17 +480,92 @@ impl WalReader {
 
         for msg in rows {
             if let SimpleQueryMessage::Row(row) = msg {
-                if let Some(data) = row.get(0) {
-                    // Parse test_decoding output format:
-                    // "table documentdb_data.documents_2: INSERT: shard_key_value[bigint]:2 object_id[documentdb_core.bson]:'BSONHEX...' document[documentdb_core.bson]:'BSONHEX...'"
-                    if let Some(change) = Self::parse_test_decoding_output(data) {
+                let lsn_str = row.get(0);
+                let data = row.get(1);
+                
+                if let (Some(lsn_s), Some(d)) = (lsn_str, data) {
+                    // Parse test_decoding output format
+                    if let Some(mut change) = Self::parse_test_decoding_output(d) {
+                        // Parse LSN string (format: "0/1A2B3C4D") to u64
+                        change.lsn = Self::parse_lsn(lsn_s);
+                        log::debug!(
+                            "poll_changes: parsed change lsn={} ({}) schema={} table={} kind={}",
+                            change.lsn, lsn_s, change.schema, change.table, change.kind
+                        );
                         changes.push(change);
                     }
                 }
             }
         }
 
+        if !changes.is_empty() {
+            log::debug!("poll_changes: returning {} changes", changes.len());
+        }
+
         Ok(changes)
+    }
+
+    /// Get changes from a specific LSN for resume token replay
+    /// Used when a cursor is created with resumeAfter to catch up on missed changes
+    pub async fn get_changes_from_lsn(
+        client: &Client,
+        slot_name: &str,
+        start_lsn: u64,
+        max_changes: i32,
+    ) -> Result<Vec<WalChange>> {
+        // Convert u64 LSN back to PostgreSQL format
+        let lsn_str = Self::format_lsn(start_lsn);
+        
+        // Use pg_logical_slot_peek_changes with the start LSN
+        // Note: start_lsn is exclusive - we'll get changes AFTER this LSN
+        let query = format!(
+            "SELECT lsn, data FROM pg_logical_slot_peek_changes('{}', '{}', {})",
+            slot_name, lsn_str, max_changes
+        );
+
+        let rows = client.simple_query(&query).await.map_err(|e| {
+            DocumentDBError::internal_error(format!("Failed to get changes from LSN: {}", e))
+        })?;
+
+        let mut changes = Vec::new();
+
+        for msg in rows {
+            if let SimpleQueryMessage::Row(row) = msg {
+                let lsn_str = row.get(0);
+                let data = row.get(1);
+                
+                if let (Some(lsn_s), Some(d)) = (lsn_str, data) {
+                    if let Some(mut change) = Self::parse_test_decoding_output(d) {
+                        change.lsn = Self::parse_lsn(lsn_s);
+                        // Only include changes AFTER the resume token LSN
+                        if change.lsn > start_lsn {
+                            changes.push(change);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(changes)
+    }
+
+    /// Parse PostgreSQL LSN string (e.g., "0/1A2B3C4D") to u64
+    fn parse_lsn(lsn_str: &str) -> u64 {
+        // LSN format: "high/low" where both are hex
+        if let Some((high, low)) = lsn_str.split_once('/') {
+            let high_val = u64::from_str_radix(high, 16).unwrap_or(0);
+            let low_val = u64::from_str_radix(low, 16).unwrap_or(0);
+            (high_val << 32) | low_val
+        } else {
+            0
+        }
+    }
+
+    /// Format u64 LSN as PostgreSQL string (e.g., "0/1A2B3C4D")
+    fn format_lsn(lsn: u64) -> String {
+        let high = (lsn >> 32) as u32;
+        let low = (lsn & 0xFFFFFFFF) as u32;
+        format!("{:X}/{:X}", high, low)
     }
 
     /// Parse test_decoding output into a WalChange
@@ -471,6 +606,7 @@ impl WalReader {
             columnvalues: Vec::new(),
             oldkeys: None,
             raw_data: data.to_string(),
+            lsn: 0, // LSN will be set by caller (poll_changes)
         })
     }
 
@@ -505,6 +641,7 @@ impl Clone for WalReader {
             reader_task: Arc::clone(&self.reader_task),
             collection_cache: Arc::clone(&self.collection_cache),
             ready_notify: Arc::clone(&self.ready_notify),
+            replay_buffer: Arc::clone(&self.replay_buffer),
         }
     }
 }
