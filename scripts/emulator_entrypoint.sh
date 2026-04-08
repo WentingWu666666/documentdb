@@ -4,6 +4,12 @@
 cleanup() {
     echo "Shutting down DocumentDB components..."
     
+    # Kill OTel Collector if it exists
+    if [ -n "${otel_pid:-}" ]; then
+        echo "Stopping OTel Collector (PID: $otel_pid)"
+        kill $otel_pid 2>/dev/null || true
+    fi
+
     # Kill log streaming processes if they exist
     for pid_var in PG_LOG_TAIL_PID SYSTEM_PG_LOG_TAIL_PID OSS_LOG_TAIL_PID GATEWAY_LOG_TAIL_PID; do
         pid_value=$(eval echo \$${pid_var})
@@ -541,6 +547,39 @@ echo "Filter specific logs: docker logs <container_name> | grep '[PREFIX]'"
 echo "Example: docker logs <container_name> | grep '[POSTGRES]'"
 echo "=========================="
 echo ""
+
+# Start OTel Collector if configured
+otel_pid=""
+if command -v otelcol-contrib &> /dev/null; then
+    echo "[OTEL] Starting OTel Collector..."
+
+    # Build connection string for sqlquery receivers
+    export PG_CONN_STRING="host=localhost port=$POSTGRESQL_PORT user=$OWNER dbname=postgres sslmode=disable"
+
+    # Build --config args from available config files
+    OTEL_CONFIGS=""
+    for cfg in /etc/otel/engine_metrics.yaml /etc/otel/host_metrics.yaml /etc/otel/base.yaml; do
+        if [ -f "$cfg" ]; then
+            OTEL_CONFIGS="$OTEL_CONFIGS --config=file:$cfg"
+        fi
+    done
+
+    # Add OTLP exporter fragment if endpoint is configured
+    if [ -n "${OTEL_EXPORTER_OTLP_ENDPOINT:-}" ] && [ -f /etc/otel/exporters/otlp.yaml ]; then
+        OTEL_CONFIGS="$OTEL_CONFIGS --config=file:/etc/otel/exporters/otlp.yaml"
+        echo "[OTEL] OTLP exporter enabled → $OTEL_EXPORTER_OTLP_ENDPOINT"
+    fi
+
+    if [ -n "$OTEL_CONFIGS" ]; then
+        otelcol-contrib $OTEL_CONFIGS &
+        otel_pid=$!
+        echo "[OTEL] Collector started with PID: $otel_pid"
+    else
+        echo "[OTEL] No config files found, skipping collector startup"
+    fi
+else
+    echo "[OTEL] otelcol-contrib not found, skipping collector startup"
+fi
 
 # Wait for the gateway process to keep the container alive
 # The wait will be interrupted by signals, allowing cleanup to run

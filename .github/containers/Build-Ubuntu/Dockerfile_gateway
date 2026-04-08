@@ -44,9 +44,16 @@ RUN sudo groupmod -g 103 postgres && sudo usermod -u 105 -g 103 postgres
 
 RUN sudo apt-get update && \
     sudo apt-get install -y --no-install-recommends \
-    jq openssl lsof wget gnupg netcat-openbsd && \
+    jq openssl lsof wget curl gnupg netcat-openbsd && \
     sudo apt-get upgrade -y && \
     sudo rm -rf /var/lib/apt/lists/*
+
+# Install otelcol-contrib for embedded metrics collection
+ARG OTELCOL_VERSION=0.116.0
+ARG TARGETARCH=amd64
+RUN sudo curl -fsSL "https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v${OTELCOL_VERSION}/otelcol-contrib_${OTELCOL_VERSION}_linux_${TARGETARCH}.tar.gz" \
+    | sudo tar xz -C /usr/local/bin otelcol-contrib && \
+    sudo chmod +x /usr/local/bin/otelcol-contrib
 
 RUN wget -qO - https://www.mongodb.org/static/pgp/server-7.0.asc | sudo apt-key add - && \
     echo "deb [ arch=amd64,arm64 ] https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/7.0 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org-7.0.list && \
@@ -95,6 +102,9 @@ COPY --from=stage /home/documentdb/code/scripts/init_documentdb_data.sh /home/do
 
 # Copy sample data for built-in initialization
 COPY --from=stage /home/documentdb/code/sample-data /home/documentdb/gateway/sample-data
+
+# Copy OTel Collector config files
+COPY telemetry/otel/ /etc/otel/
 
 # Create default initialization directory for user-provided scripts
 RUN sudo mkdir -p /init_doc_db.d

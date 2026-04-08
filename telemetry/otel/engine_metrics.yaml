@@ -1,0 +1,68 @@
+# Engine metrics collected via SQL queries against PostgreSQL/DocumentDB.
+# These are shared between documentdb-local (embedded collector) and K8s (via ImageVolume).
+#
+# Receiver: sqlquery (from opentelemetry-collector-contrib)
+# Requires: PG_CONN_STRING env var (set by entrypoint or operator ConfigMap)
+
+receivers:
+  sqlquery/connections:
+    driver: postgres
+    datasource: "${PG_CONN_STRING}"
+    collection_interval: 30s
+    queries:
+      - sql: >
+          SELECT state, count(*) as connection_count
+          FROM pg_stat_activity
+          WHERE datname IS NOT NULL
+          GROUP BY state
+        metrics:
+          - metric_name: documentdb.connections
+            value_column: connection_count
+            attribute_columns: [state]
+            value_type: int
+            data_type: gauge
+            description: "Number of database connections by state"
+            unit: "{connections}"
+
+  sqlquery/replication:
+    driver: postgres
+    datasource: "${PG_CONN_STRING}"
+    collection_interval: 30s
+    queries:
+      - sql: >
+          SELECT
+            CASE WHEN pg_is_in_recovery() THEN
+              COALESCE(EXTRACT(EPOCH FROM (now() - pg_last_xact_replay_timestamp()))::bigint, -1)
+            ELSE 0 END as replication_lag_seconds
+        metrics:
+          - metric_name: documentdb.replication.lag
+            value_column: replication_lag_seconds
+            value_type: int
+            data_type: gauge
+            description: "Replication lag in seconds (0 on primary, -1 if no replay)"
+            unit: "s"
+
+  sqlquery/index_stats:
+    driver: postgres
+    datasource: "${PG_CONN_STRING}"
+    collection_interval: 60s
+    queries:
+      - sql: >
+          SELECT
+            schemaname,
+            relname as table_name,
+            indexrelname as index_name,
+            idx_scan as index_scans,
+            idx_tup_read as tuples_read,
+            idx_tup_fetch as tuples_fetched
+          FROM pg_stat_user_indexes
+          ORDER BY idx_scan DESC
+          LIMIT 20
+        metrics:
+          - metric_name: documentdb.index.scans
+            value_column: index_scans
+            attribute_columns: [schemaname, table_name, index_name]
+            value_type: int
+            data_type: gauge
+            description: "Number of index scans initiated on this index"
+            unit: "{scans}"

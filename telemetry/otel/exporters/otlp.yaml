@@ -1,0 +1,14 @@
+# OTLP exporter fragment — merged when OTEL_EXPORTER_OTLP_ENDPOINT is set.
+# Uses OTel Collector's native env var substitution.
+
+exporters:
+  otlp:
+    endpoint: "${OTEL_EXPORTER_OTLP_ENDPOINT}"
+    tls:
+      insecure: ${OTEL_EXPORTER_OTLP_INSECURE:-true}
+
+service:
+  pipelines:
+    metrics:
+      exporters:
+        - otlp

@@ -40,9 +40,16 @@ FROM mcr.microsoft.com/mirror/docker/library/ubuntu:22.04 AS final
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-    jq openssl lsof sudo ca-certificates netcat-openbsd postgresql-client && \
+    jq openssl lsof sudo ca-certificates curl netcat-openbsd postgresql-client && \
     apt-get upgrade -y && \
     rm -rf /var/lib/apt/lists/*
+
+# Install otelcol-contrib for embedded metrics collection
+ARG OTELCOL_VERSION=0.116.0
+ARG TARGETARCH=amd64
+RUN curl -fsSL "https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v${OTELCOL_VERSION}/otelcol-contrib_${OTELCOL_VERSION}_linux_${TARGETARCH}.tar.gz" \
+    | tar xz -C /usr/local/bin otelcol-contrib && \
+    chmod +x /usr/local/bin/otelcol-contrib
 
 ENV LANGUAGE=en_US.UTF-8 \
     TERM=xterm-256color
@@ -60,6 +67,9 @@ COPY --from=stage /home/documentdb/code/documentdb-local/pg_documentdb_gw/SetupC
 COPY --from=stage /home/documentdb/code/documentdb-local/scripts/build_and_start_gateway.sh /home/documentdb/gateway/scripts/build_and_start_gateway.sh
 COPY --from=stage /home/documentdb/code/documentdb-local/scripts/utils.sh /home/documentdb/gateway/scripts/utils.sh
 COPY --from=stage /home/documentdb/code/documentdb-local/scripts/emulator_entrypoint.sh /home/documentdb/gateway/scripts/emulator_entrypoint.sh
+
+# Copy OTel Collector config files
+COPY telemetry/otel/ /etc/otel/
 
 RUN sudo chown -R documentdb:documentdb /home/documentdb/gateway
 

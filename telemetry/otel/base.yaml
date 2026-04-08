@@ -1,0 +1,44 @@
+# Base OTel Collector configuration for documentdb-local.
+# Defines the pipeline that ties receivers → processors → exporters.
+#
+# In documentdb-local: this file is always loaded.
+# In K8s: the operator generates a similar base.yaml via ConfigMap
+#   (with cluster-specific resource attributes and exporter config).
+#
+# The debug exporter is always-on for POC verification.
+# OTLP exporter is loaded via a separate fragment when OTEL_EXPORTER_OTLP_ENDPOINT is set.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: "0.0.0.0:4317"
+
+processors:
+  batch:
+    send_batch_size: 1024
+    timeout: 5s
+
+  resourcedetection:
+    detectors: [env, system]
+    system:
+      hostname_sources: [os]
+
+exporters:
+  debug:
+    verbosity: basic
+
+service:
+  pipelines:
+    metrics:
+      receivers:
+        - otlp
+        - hostmetrics
+        - sqlquery/connections
+        - sqlquery/replication
+        - sqlquery/index_stats
+      processors:
+        - resourcedetection
+        - batch
+      exporters:
+        - debug

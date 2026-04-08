@@ -1,0 +1,24 @@
+# Host/system metrics collected via the hostmetrics receiver.
+# Shared between documentdb-local (embedded collector) and K8s (via ImageVolume).
+#
+# In documentdb-local: reads from /proc (host metrics)
+# In K8s: reads from container /proc (container-level metrics)
+
+receivers:
+  hostmetrics:
+    collection_interval: 30s
+    scrapers:
+      cpu:
+        metrics:
+          system.cpu.utilization:
+            enabled: true
+      memory:
+        metrics:
+          system.memory.utilization:
+            enabled: true
+      disk: {}
+      network: {}
+      filesystem:
+        metrics:
+          system.filesystem.utilization:
+            enabled: true
