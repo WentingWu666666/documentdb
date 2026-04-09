@@ -1,0 +1,47 @@
+# Docker Compose for DocumentDB + Grafana observability stack.
+#
+# Usage:
+#   docker compose -f telemetry/grafana/docker-compose.yml up
+#
+# This starts:
+#   - documentdb-local  (port 10260 for gateway, 8889 for OTel prometheus metrics)
+#   - prometheus        (port 9090)
+#   - grafana           (port 3000, login: admin/admin)
+#
+# Pre-provisioned dashboard: "DocumentDB Overview"
+
+services:
+  documentdb:
+    image: documentdb-local:grafana
+    container_name: documentdb
+    ports:
+      - "10260:10260"
+      - "8889:8889"
+    environment:
+      - DOCUMENTDB_PASSWORD=test1234
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      - documentdb
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+    volumes:
+      - ./provisioning:/etc/grafana/provisioning:ro
+      - ./dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus

@@ -1,0 +1,24 @@
+FROM ghcr.io/microsoft/documentdb/documentdb-local:latest
+
+USER root
+
+# Install OTel Collector and netcat
+RUN apt-get update && apt-get install -y curl netcat-openbsd && rm -rf /var/lib/apt/lists/* \
+    && curl -L -o /tmp/otelcol.tar.gz \
+       https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v0.96.0/otelcol-contrib_0.96.0_linux_amd64.tar.gz \
+    && tar -xzf /tmp/otelcol.tar.gz -C /usr/local/bin/ otelcol-contrib \
+    && chmod +x /usr/local/bin/otelcol-contrib \
+    && rm /tmp/otelcol.tar.gz
+
+# Copy OTel config files
+COPY telemetry/otel/engine_metrics.yaml /etc/otel/engine_metrics.yaml
+COPY telemetry/otel/host_metrics.yaml /etc/otel/host_metrics.yaml
+COPY telemetry/otel/base.yaml /etc/otel/base.yaml
+
+# Wrapper entrypoint: starts OTel after gateway is ready
+COPY telemetry/grafana/start-with-otel.sh /usr/local/bin/start-with-otel.sh
+RUN chmod +x /usr/local/bin/start-with-otel.sh
+
+USER documentdb
+
+ENTRYPOINT ["/bin/bash", "-c", "/usr/local/bin/start-with-otel.sh \"$@\"", "--"]
